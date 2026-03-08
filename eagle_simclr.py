@@ -463,7 +463,7 @@ def plot_embeddings(hs: np.ndarray, logdir: Path, step: int, bird_ids: list):
 
     # UMAP
     try:
-        umap_emb = UMAP(n_components=2, random_state=42).fit_transform(hs)
+        umap_emb = UMAP(n_components=2, random_state=42, n_neighbors=15, min_dist=0.1).fit_transform(hs)
         axes[1].scatter(umap_emb[:, 0], umap_emb[:, 1], c=colour_idx,
                         cmap="tab20", alpha=0.4, s=2)
         axes[1].set_title("UMAP")
@@ -591,29 +591,26 @@ class Trainer:
         print("Training complete.")
 
     # ------------------------------------------------------------------
+
+    
     @torch.no_grad()
     def infer(self):
-        """
-        Run all windows through encoder.
-        Writes:  {step}_embeddings.csv  with columns:
-            bird_id, window_start, h_0..h_{H-1}, z_0..z_{Z-1}
-        Also saves PCA + UMAP plots.
-        """
         print(f"[step {self.step}] Running inference on {len(self.ds)} windows...")
         self.model.eval()
-
+    
         m = self.model.module if hasattr(self.model, "module") else self.model
-
+    
         loader = data.DataLoader(
             self.ds,
             batch_size=512,
             shuffle=False,
-            num_workers=4,
+            num_workers=0,        # data already in RAM — workers just add fork overhead
             collate_fn=collate_eagle,
+            pin_memory=False,
         )
-
+    
         all_h, all_z, all_birds, all_windows = [], [], [], []
-
+    
         for v0, v0_lens, _, _, bird_ids, window_starts in tqdm(loader, desc="infer", leave=False):
             v0      = v0.to(DEVICE)
             v0_lens = v0_lens.to(DEVICE)
@@ -622,7 +619,7 @@ class Trainer:
             all_z.append(z.cpu().numpy())
             all_birds.extend(bird_ids)
             all_windows.extend(window_starts)
-
+    
         hs = np.concatenate(all_h, axis=0)
         zs = np.concatenate(all_z, axis=0)
 
@@ -640,10 +637,12 @@ class Trainer:
         out_csv = self.logdir / f"{self.step:08d}_embeddings.csv"
         df.to_csv(out_csv, index=False)
         print(f"  Wrote embeddings → {out_csv}  ({len(df)} rows)")
-
-        plot_embeddings(hs, self.logdir, self.step, all_birds)
-
-
+    
+        # Subsample for plotting — UMAP on 144k points hangs
+        plot_n = min(10_000, len(hs))
+        idx    = np.random.choice(len(hs), plot_n, replace=False)
+        plot_embeddings(hs[idx], self.logdir, self.step, [all_birds[i] for i in idx])
+    
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
