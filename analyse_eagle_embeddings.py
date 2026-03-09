@@ -276,18 +276,20 @@ class PlotContext:
     step:       int = 0
     space:      str = "z"
     cat_df:     Optional[pd.DataFrame] = None
+    win_cat:    Optional[pd.DataFrame] = None   # window_catalogue joined to meta indices
     # convenience: unique birds in display order
     birds:      List[str] = field(default_factory=list)
     bird_colour: Dict[str, int] = field(default_factory=dict)
 
 
 def build_context(
-    logdir:     Path,
-    cat_path:   Optional[Path],
-    step:       Optional[int],
-    space:      str,
-    n_clusters: int,
+    logdir:      Path,
+    cat_path:    Optional[Path],
+    step:        Optional[int],
+    space:       str,
+    n_clusters:  int,
     umap_sample: int,
+    win_cat_path: Optional[Path] = None,
 ) -> PlotContext:
     emb_df   = load_embeddings(logdir, step)
     cat_df   = load_catalogue(cat_path)
@@ -339,6 +341,21 @@ def build_context(
     birds = sorted(meta["bird_id"].unique())
     bird_colour = {b: i for i, b in enumerate(birds)}
 
+    # Load and join window catalogue if provided
+    win_cat = None
+    if win_cat_path is not None and Path(win_cat_path).exists():
+        print(f"Loading window catalogue: {win_cat_path.name}")
+        wc = pd.read_csv(win_cat_path, low_memory=False)
+        wc["window_start"] = pd.to_datetime(wc["window_start"], utc=True, errors="coerce")
+        # Normalise bird_id column name
+        if "bird_id" not in wc.columns and "individual-local-identifier" in wc.columns:
+            wc = wc.rename(columns={"individual-local-identifier": "bird_id"})
+        print(f"  {len(wc):,} window rows  ·  {len(wc.columns)} columns")
+        win_cat = wc
+    else:
+        if win_cat_path is not None:
+            print(f"[warn] window catalogue not found: {win_cat_path}")
+
     return PlotContext(
         emb_df=emb_df, meta=meta, arr=arr, arr_sub=arr_sub, sub_idx=sub_idx,
         pca2=pca2, umap2=umap2,
@@ -346,6 +363,7 @@ def build_context(
         loss_df=loss_df, n_clusters=n_clusters,
         step=resolved_step, space=space, cat_df=cat_df,
         birds=birds, bird_colour=bird_colour,
+        win_cat=win_cat,
     )
 
 
@@ -1144,6 +1162,553 @@ def plot_individual_bird(ctx: PlotContext, outdir: Path,
         _save(fig, per_bird_dir / f"bird_{bird}.png")
 
 
+# ── 4.15  Comprehensive male vs female study ─────────────────────────────────
+
+def plot_sex_study(ctx: PlotContext, outdir: Path) -> None:
+    """
+    Full male vs female comparison across five dimensions:
+      A. UMAP / PCA positions — density and separation
+      B. Feature distributions — violin plots for catalogue movement features
+      C. Cluster usage — how much does each sex use each cluster?
+      D. Seasonal (DOY) pattern — do they move through latent space differently?
+      E. Diel pattern — do they differ by time of day?
+    """
+    coords = ctx.umap2 if ctx.umap2 is not None else ctx.pca2
+    tag    = "UMAP" if ctx.umap2 is not None else "PCA"
+    if coords is None:
+        print("  [skip] No 2D reduction available.")
+        return
+    if "animal-sex" not in ctx.meta.columns:
+        print("  [skip] animal-sex column not available — check catalogue join.")
+        return
+
+    meta     = ctx.meta.copy()
+    meta_sub = meta.iloc[ctx.sub_idx].reset_index(drop=True)
+    if ctx.cluster_labels is not None:
+        meta["cluster"] = ctx.cluster_labels
+    x, y = coords[:, 0], coords[:, 1]
+
+    # Normalise sex labels to 'm' / 'f' / 'unknown'
+    def _norm_sex(s):
+        s = str(s).strip().lower()
+        if s in ("m", "male"):   return "m"
+        if s in ("f", "female"): return "f"
+        return "unknown"
+
+    meta["sex"]     = meta["animal-sex"].map(_norm_sex)
+    meta_sub["sex"] = meta_sub["animal-sex"].map(_norm_sex)
+
+    SEX_COL = {"m": "#3a86ff", "f": "#e63946", "unknown": "#aaaaaa"}
+    SEX_LABEL = {"m": "Male", "f": "Female", "unknown": "Unknown"}
+
+    # ── A. UMAP / PCA panel ──────────────────────────────────────────────────
+    fig, axs = plt.subplots(1, 3, figsize=(15, 5))
+    fig.suptitle(f"Sex comparison — {tag}  ·  step {ctx.step:,}", fontsize=12)
+
+    axs[0].scatter(x, y, s=S_DOT, alpha=0.2, color="lightgrey", rasterized=True)
+    for sx, col in SEX_COL.items():
+        m = meta_sub["sex"] == sx
+        if m.sum() == 0:
+            continue
+        axs[0].scatter(x[m], y[m], s=S_DOT, alpha=0.55, color=col,
+                       label=f"{SEX_LABEL[sx]} ({m.sum():,})", rasterized=True)
+    axs[0].legend(fontsize=8); axs[0].set_title("All sexes"); axs[0].set_xticks([]); axs[0].set_yticks([])
+
+    for ax, sx in [(axs[1], "m"), (axs[2], "f")]:
+        mask = meta_sub["sex"] == sx
+        ax.scatter(x[~mask], y[~mask], s=1, alpha=0.12, color="lightgrey", rasterized=True)
+        ax.scatter(x[mask], y[mask], s=S_DOT + 1, alpha=0.65,
+                   color=SEX_COL[sx], rasterized=True)
+        ax.set_title(f"{SEX_LABEL[sx]}  (n={mask.sum():,} windows)")
+        ax.set_xticks([]); ax.set_yticks([])
+
+    _save(fig, outdir / "sex_umap.png")
+
+    # ── B. Feature distribution violins ──────────────────────────────────────
+    feat_cols = [
+        "bird_speed_mean_mean", "bird_tortuosity_mean", "bird_path_efficiency_mean",
+        "bird_net_displacement_km_mean", "bird_alt_mean_mean",
+        "bird_frac_stationary_windows", "bird_frac_active_windows",
+        "bird_frac_fast_windows", "duration_days",
+    ]
+    feat_cols = [c for c in feat_cols if c in meta.columns]
+
+    if feat_cols:
+        # One row per bird — use bird-level stats, not window-level
+        bird_sex = (meta.groupby("bird_id")["sex"]
+                    .first().reset_index().rename(columns={"sex": "bird_sex"}))
+        bird_stats = (meta.groupby("bird_id")[feat_cols]
+                      .first().reset_index())
+        bird_df = bird_stats.merge(bird_sex, on="bird_id")
+
+        ncols = 3
+        nrows = int(np.ceil(len(feat_cols) / ncols))
+        fig, axs = plt.subplots(nrows, ncols, figsize=(ncols * 4, nrows * 3.5))
+        axs = np.array(axs).flatten()
+        fig.suptitle("Feature distributions by sex  (bird-level)", fontsize=11)
+
+        for i, feat in enumerate(feat_cols):
+            ax = axs[i]
+            groups = []
+            labels = []
+            colours = []
+            for sx in ["m", "f"]:
+                vals = bird_df.loc[bird_df["bird_sex"] == sx, feat].dropna().values
+                if len(vals) > 0:
+                    groups.append(vals)
+                    labels.append(SEX_LABEL[sx])
+                    colours.append(SEX_COL[sx])
+            if not groups:
+                ax.axis("off"); continue
+            parts = ax.violinplot(groups, positions=range(len(groups)),
+                                  showmedians=True, showextrema=False)
+            for pc, col in zip(parts["bodies"], colours):
+                pc.set_facecolor(col); pc.set_alpha(0.6)
+            ax.set_xticks(range(len(labels)))
+            ax.set_xticklabels(labels, fontsize=8)
+            ax.set_title(feat.replace("bird_", "").replace("_", " "), fontsize=8)
+
+            # Add individual points (n is small enough)
+            for xi, (vals, col) in enumerate(zip(groups, colours)):
+                jitter = np.random.default_rng(42).uniform(-0.08, 0.08, len(vals))
+                ax.scatter(xi + jitter, vals, s=18, alpha=0.6, color=col, zorder=5)
+
+        for j in range(len(feat_cols), len(axs)):
+            axs[j].axis("off")
+        _save(fig, outdir / "sex_features.png")
+
+    # ── C. Cluster usage by sex ────────────────────────────────────────────
+    if ctx.cluster_labels is not None:
+        k    = ctx.n_clusters
+        cmap = _cluster_cmap(k)
+
+        sex_cluster = {}
+        for sx in ["m", "f"]:
+            rows = meta[meta["sex"] == sx]
+            if len(rows) == 0:
+                continue
+            counts = np.bincount(rows["cluster"].values, minlength=k)
+            sex_cluster[sx] = counts / counts.sum()
+
+        if sex_cluster:
+            fig, ax = plt.subplots(figsize=(max(8, k * 1.1), 5))
+            w = 0.35
+            xs = np.arange(k)
+            for offset, (sx, fracs) in zip([-w/2, w/2], sex_cluster.items()):
+                ax.bar(xs + offset, fracs * 100, width=w,
+                       color=SEX_COL[sx], label=SEX_LABEL[sx],
+                       alpha=0.8, edgecolor="white")
+            ax.set_xticks(xs); ax.set_xticklabels([f"C{i}" for i in range(k)])
+            ax.set_ylabel("% of windows"); ax.set_xlabel("Cluster")
+            ax.set_title(f"Cluster usage by sex  (k={k})")
+            ax.legend(fontsize=9)
+            _save(fig, outdir / "sex_cluster_usage.png")
+
+    # ── D. Seasonal pattern — mean PC1/PC2 per DOY bin per sex ───────────────
+    if HAS_SKLEARN:
+        from sklearn.decomposition import PCA as _PCA
+        pca_full = _PCA(n_components=2, random_state=42).fit_transform(ctx.arr)
+        meta["pc1"] = pca_full[:, 0]
+        meta["pc2"] = pca_full[:, 1]
+        meta["doy_bin"] = (meta["doy"] // 10) * 10
+
+        fig, axs = plt.subplots(1, 2, figsize=(14, 5))
+        fig.suptitle("Seasonal latent trajectory by sex", fontsize=11)
+
+        for sx, col in [("m", "#3a86ff"), ("f", "#e63946")]:
+            rows = meta[meta["sex"] == sx]
+            if len(rows) < 10:
+                continue
+            g = rows.groupby("doy_bin")[["pc1", "pc2"]].mean().dropna()
+            axs[0].plot(g["pc1"], g["pc2"], color=col, lw=1.5,
+                        label=SEX_LABEL[sx], alpha=0.85)
+            sc = axs[0].scatter(g["pc1"], g["pc2"],
+                                c=g.index, cmap="hsv", s=40,
+                                edgecolors=col, linewidths=0.8, zorder=5)
+            axs[1].plot(g.index, g["pc1"], color=col, lw=1.5,
+                        label=f"{SEX_LABEL[sx]} PC1", linestyle="-")
+            axs[1].plot(g.index, g["pc2"], color=col, lw=1.5,
+                        label=f"{SEX_LABEL[sx]} PC2", linestyle="--", alpha=0.6)
+
+        axs[0].set_xlabel("PC1"); axs[0].set_ylabel("PC2")
+        axs[0].set_title("Mean PC position per 10-day DOY bin")
+        axs[0].legend(fontsize=8)
+        axs[1].set_xlabel("Day of year"); axs[1].set_ylabel("Mean PC coord")
+        axs[1].set_title("PC1 & PC2 through year by sex")
+        axs[1].legend(fontsize=7, ncol=2)
+        _save(fig, outdir / "sex_seasonal.png")
+
+    # ── E. Diel pattern ────────────────────────────────────────────────────
+    if HAS_SKLEARN and "pc1" in meta.columns:
+        fig, axs = plt.subplots(1, 2, figsize=(14, 5))
+        fig.suptitle("Diel latent pattern by sex", fontsize=11)
+
+        for sx, col in [("m", "#3a86ff"), ("f", "#e63946")]:
+            rows = meta[meta["sex"] == sx]
+            if len(rows) < 10:
+                continue
+            g = rows.groupby("hour")[["pc1", "pc2"]].mean()
+            axs[0].plot(list(g["pc1"]) + [g["pc1"].iloc[0]],
+                        list(g["pc2"]) + [g["pc2"].iloc[0]],
+                        color=col, lw=1.5, label=SEX_LABEL[sx])
+            axs[0].scatter(g["pc1"], g["pc2"], c=g.index,
+                           cmap="twilight_shifted", s=50,
+                           edgecolors=col, linewidths=0.8, zorder=5)
+            axs[1].plot(g.index, g["pc1"], color=col, lw=1.5, linestyle="-",
+                        label=f"{SEX_LABEL[sx]} PC1")
+            axs[1].plot(g.index, g["pc2"], color=col, lw=1.5, linestyle="--",
+                        alpha=0.6, label=f"{SEX_LABEL[sx]} PC2")
+
+        axs[0].set_xlabel("PC1"); axs[0].set_ylabel("PC2")
+        axs[0].set_title("Mean PC position per hour (cyclic)")
+        axs[0].legend(fontsize=8)
+        axs[1].set_xlabel("Hour (UTC)"); axs[1].set_ylabel("Mean PC coord")
+        axs[1].set_title("Diel PC rhythm by sex")
+        axs[1].set_xticks(range(0, 24, 2))
+        axs[1].legend(fontsize=7, ncol=2)
+        _save(fig, outdir / "sex_diel.png")
+
+
+# ── 4.16  Behaviour inference ─────────────────────────────────────────────────
+
+# Heuristic thresholds — edit these first if results look off
+BEHAVIOUR_THRESHOLDS = {
+    # name:         (condition_fn, priority)
+    # Lower priority number = checked first
+    "diving":       1,   # fastest vertical descent, very high speed burst
+    "thermal":      2,   # circling upward
+    "gliding":      3,   # descending, straight, low effort
+    "flying":       4,   # fast directed translocation
+    "hunting":      5,   # tortuous, variable, moderate speed
+    "stationary":   6,   # near-zero movement
+    "unknown":      99,
+}
+
+BEHAVIOUR_COLOURS = {
+    "diving":    "#e63946",
+    "thermal":   "#ffb703",
+    "gliding":   "#8ecae6",
+    "flying":    "#023e8a",
+    "hunting":   "#6a994e",
+    "stationary":"#aaaaaa",
+    "unknown":   "#dddddd",
+}
+
+BEHAVIOUR_ORDER = ["stationary", "flying", "gliding", "thermal", "hunting", "diving", "unknown"]
+
+
+def _classify_window(row) -> str:
+    """
+    Rule-based behavioural label for a single window-catalogue row.
+    Uses speed, vertical rate, heading concentration, tortuosity, path efficiency.
+    Returns a label string.
+    """
+    def get(col, default=np.nan):
+        v = row.get(col, default)
+        return default if pd.isna(v) else float(v)
+
+    speed       = get("speed_mean")
+    speed_max   = get("speed_max")
+    vrate       = get("vrate_mean")
+    vdesc       = get("vrate_max_descent")   # most negative value = fast descent
+    vclimb      = get("vrate_max_climb")
+    frac_climb  = get("frac_climbing")
+    frac_desc   = get("frac_descending")
+    frac_level  = get("frac_level")
+    hconc       = get("heading_concentration")  # 1=directed, 0=circling
+    tortuous    = get("tortuosity")
+    path_eff    = get("path_efficiency")
+    turn_mean   = get("turn_mean_deg")
+    frac_sharp  = get("frac_sharp_turns")
+    frac_str    = get("frac_straight")
+    frac_low    = get("frac_low_speed")
+
+    # ── Stationary / walking ──────────────────────────────────────────────
+    # Very low speed AND barely any displacement
+    if (not np.isnan(speed) and speed < 1.0) and \
+       (np.isnan(frac_low) or frac_low > 0.7):
+        return "stationary"
+
+    # ── Diving ───────────────────────────────────────────────────────────
+    # Rapid descent AND high speed  (e.g. stoop)
+    if (not np.isnan(vdesc) and vdesc < -3.0) and \
+       (not np.isnan(speed_max) and speed_max > 15.0):
+        return "diving"
+
+    # ── Thermal soaring ───────────────────────────────────────────────────
+    # Net climbing, circling (low heading concentration), low path efficiency
+    if (not np.isnan(frac_climb) and frac_climb > 0.35) and \
+       (not np.isnan(hconc) and hconc < 0.55) and \
+       (np.isnan(path_eff) or path_eff < 0.5):
+        return "thermal"
+
+    # ── Gliding ──────────────────────────────────────────────────────────
+    # Net descending, relatively straight, moderate speed
+    if (not np.isnan(frac_desc) and frac_desc > 0.40) and \
+       (not np.isnan(frac_str) and frac_str > 0.35) and \
+       (not np.isnan(speed) and speed > 4.0):
+        return "gliding"
+
+    # ── Directed flying / commuting ───────────────────────────────────────
+    # Fast, straight, high heading concentration, efficient path
+    if (not np.isnan(speed) and speed > 7.0) and \
+       (not np.isnan(hconc) and hconc > 0.65) and \
+       (np.isnan(path_eff) or path_eff > 0.55):
+        return "flying"
+
+    # ── Hunting / searching ───────────────────────────────────────────────
+    # Moderate speed, tortuous, many turns, low path efficiency
+    if (not np.isnan(speed) and 1.5 < speed < 10.0) and \
+       (not np.isnan(tortuous) and tortuous > 2.5) and \
+       (not np.isnan(frac_sharp) and frac_sharp > 0.15):
+        return "hunting"
+
+    return "unknown"
+
+
+def _load_window_features_for_behaviour(ctx: PlotContext) -> Optional[pd.DataFrame]:
+    """
+    Joins the window catalogue to the embedding meta on (bird_id, window_start).
+    Returns a DataFrame with behaviour labels attached, aligned to ctx.meta index.
+    Returns None if win_cat is not available.
+    """
+    if ctx.win_cat is None:
+        return None
+
+    wc = ctx.win_cat.copy()
+    wc["window_start"] = pd.to_datetime(wc["window_start"], utc=True, errors="coerce")
+
+    meta = ctx.meta[["bird_id", "window_start"]].copy()
+    meta["window_start"] = pd.to_datetime(meta["window_start"], utc=True, errors="coerce")
+    meta = meta.reset_index(drop=True)
+    meta["_meta_idx"] = meta.index
+
+    merged = meta.merge(wc, on=["bird_id", "window_start"], how="left")
+
+    # Apply heuristic classifier to each row
+    print("  Classifying behaviour for each window …")
+    merged["behaviour"] = merged.apply(_classify_window, axis=1)
+
+    return merged
+
+
+def plot_behaviour_inference(ctx: PlotContext, outdir: Path) -> None:
+    """
+    Heuristic behavioural state inference using window-catalogue movement features.
+    Requires --window_catalogue to be provided.
+
+    Produces:
+      A. UMAP coloured by behaviour label — shows where each behaviour sits
+      B. Behaviour fraction bar per bird — each bird's behavioural fingerprint
+      C. Behaviour timeline per bird (sample) — when does each behaviour occur?
+      D. Feature validation violins — confirms heuristics are sensible
+      E. Seasonal and diel behaviour fractions — when does each behaviour peak?
+      F. Behaviour × cluster confusion matrix — do clusters map to behaviours?
+    """
+    wf = _load_window_features_for_behaviour(ctx)
+    if wf is None:
+        print("  [skip] window_catalogue not provided — "
+              "run with --window_catalogue golden_eai_outputs/window_catalogue_1h.csv")
+        return
+
+    coords = ctx.umap2 if ctx.umap2 is not None else ctx.pca2
+    tag    = "UMAP" if ctx.umap2 is not None else "PCA"
+
+    beh_all = wf["behaviour"].values   # (N,) aligned to ctx.meta / ctx.arr
+    beh_sub = beh_all[ctx.sub_idx]
+
+    behav_dir = outdir / "behaviour"
+    behav_dir.mkdir(exist_ok=True)
+
+    # ── A. UMAP coloured by behaviour ────────────────────────────────────────
+    if coords is not None:
+        x, y = coords[:, 0], coords[:, 1]
+        fig, axs = plt.subplots(2, 4, figsize=(20, 9))
+        axs = axs.flatten()
+        fig.suptitle(f"Behavioural states in {tag}  ·  step {ctx.step:,}", fontsize=12)
+
+        # Panel 0: all behaviours
+        ax = axs[0]
+        for beh in BEHAVIOUR_ORDER:
+            m = beh_sub == beh
+            if m.sum() == 0: continue
+            ax.scatter(x[m], y[m], s=S_DOT, alpha=0.55,
+                       color=BEHAVIOUR_COLOURS[beh], label=beh, rasterized=True)
+        ax.legend(fontsize=6, markerscale=3, loc="lower right")
+        ax.set_title("All behaviours"); ax.set_xticks([]); ax.set_yticks([])
+
+        # One panel per behaviour
+        for i, beh in enumerate(BEHAVIOUR_ORDER):
+            ax = axs[i + 1]
+            mask = beh_sub == beh
+            ax.scatter(x[~mask], y[~mask], s=1, alpha=0.1, color="lightgrey", rasterized=True)
+            ax.scatter(x[mask], y[mask], s=S_DOT + 1, alpha=0.7,
+                       color=BEHAVIOUR_COLOURS[beh], rasterized=True)
+            ax.set_title(f"{beh}  ({mask.sum():,})", fontsize=8)
+            ax.set_xticks([]); ax.set_yticks([])
+
+        _save(fig, behav_dir / "behaviour_umap.png")
+
+    # ── B. Per-bird behaviour fraction bars ───────────────────────────────────
+    wf_birds = wf.copy()
+    bird_counts = wf_birds.groupby("bird_id").size().sort_values(ascending=False)
+    top_birds   = bird_counts.index[:20].tolist()
+
+    mat = []
+    for bird in top_birds:
+        rows = wf_birds[wf_birds["bird_id"] == bird]
+        counts = {beh: (rows["behaviour"] == beh).sum() for beh in BEHAVIOUR_ORDER}
+        total  = max(1, len(rows))
+        mat.append({beh: counts[beh] / total for beh in BEHAVIOUR_ORDER})
+    mat_df = pd.DataFrame(mat, index=top_birds)
+
+    fig, ax = plt.subplots(figsize=(max(10, len(top_birds) * 0.7), 5))
+    bottom = np.zeros(len(top_birds))
+    for beh in BEHAVIOUR_ORDER:
+        vals = mat_df[beh].values
+        ax.bar(range(len(top_birds)), vals * 100,
+               bottom=bottom, color=BEHAVIOUR_COLOURS[beh],
+               label=beh, edgecolor="none", width=0.9)
+        bottom += vals
+    ax.set_xticks(range(len(top_birds)))
+    ax.set_xticklabels(top_birds, rotation=45, ha="right", fontsize=7)
+    ax.set_ylabel("% of windows")
+    ax.set_title(f"Behavioural profile per bird  ·  step {ctx.step:,}")
+    ax.legend(loc="upper right", fontsize=7,
+              handles=[Patch(color=BEHAVIOUR_COLOURS[b], label=b) for b in BEHAVIOUR_ORDER])
+    _save(fig, behav_dir / "behaviour_per_bird.png")
+
+    # ── C. Behaviour timeline (top 12 birds) ─────────────────────────────────
+    plot_birds = top_birds[:12]
+    fig, axs_list = plt.subplots(len(plot_birds), 1,
+                                  figsize=(16, max(6, len(plot_birds) * 0.6)),
+                                  sharex=False)
+    if len(plot_birds) == 1:
+        axs_list = [axs_list]
+    fig.suptitle(f"Behaviour timelines  ·  step {ctx.step:,}", fontsize=11)
+
+    for ax, bird in zip(axs_list, plot_birds):
+        rows = wf_birds[wf_birds["bird_id"] == bird].sort_values("window_start")
+        t    = (rows["window_start"] - rows["window_start"].min()).dt.total_seconds() / 86400
+        for beh in BEHAVIOUR_ORDER:
+            m = rows["behaviour"].values == beh
+            ax.scatter(t.values[m], np.zeros(m.sum()),
+                       c=[BEHAVIOUR_COLOURS[beh]], s=5, alpha=0.9,
+                       marker="|", rasterized=True)
+        ax.set_yticks([])
+        ax.set_ylabel(bird, fontsize=5, rotation=0, ha="right", va="center")
+        ax.spines[["top", "right", "left"]].set_visible(False)
+    axs_list[-1].set_xlabel("Days from first fix")
+    handles = [Patch(color=BEHAVIOUR_COLOURS[b], label=b) for b in BEHAVIOUR_ORDER]
+    fig.legend(handles=handles, loc="lower center", ncol=len(BEHAVIOUR_ORDER),
+               fontsize=7, framealpha=0.7, bbox_to_anchor=(0.5, 0.0))
+    _save(fig, behav_dir / "behaviour_timelines.png")
+
+    # ── D. Feature validation violins ─────────────────────────────────────────
+    val_features = [
+        ("speed_mean",        "Mean speed (m/s)"),
+        ("vrate_mean",        "Mean vert rate (m/s)"),
+        ("vrate_max_descent", "Max descent rate (m/s)"),
+        ("heading_concentration", "Heading concentration"),
+        ("tortuosity",        "Tortuosity"),
+        ("path_efficiency",   "Path efficiency"),
+        ("frac_climbing",     "Frac climbing"),
+        ("frac_descending",   "Frac descending"),
+        ("frac_sharp_turns",  "Frac sharp turns"),
+    ]
+    val_features = [(c, lbl) for c, lbl in val_features if c in wf.columns]
+
+    if val_features:
+        ncols = 3
+        nrows = int(np.ceil(len(val_features) / ncols))
+        fig, axs = plt.subplots(nrows, ncols, figsize=(ncols * 4, nrows * 3.5))
+        axs = np.array(axs).flatten()
+        fig.suptitle("Feature distributions per inferred behaviour  (validation)", fontsize=11)
+
+        for i, (col, lbl) in enumerate(val_features):
+            ax = axs[i]
+            data   = [wf.loc[wf["behaviour"] == beh, col].dropna().values
+                      for beh in BEHAVIOUR_ORDER]
+            colors = [BEHAVIOUR_COLOURS[beh] for beh in BEHAVIOUR_ORDER]
+            non_empty = [(d, c) for d, c in zip(data, colors) if len(d) > 1]
+            if not non_empty: ax.axis("off"); continue
+            vals, cols = zip(*non_empty)
+            labels = [BEHAVIOUR_ORDER[i] for i, d in enumerate(data) if len(d) > 1]
+            parts = ax.violinplot(vals, positions=range(len(vals)),
+                                  showmedians=True, showextrema=False)
+            for pc, col_ in zip(parts["bodies"], cols):
+                pc.set_facecolor(col_); pc.set_alpha(0.65)
+            ax.set_xticks(range(len(labels)))
+            ax.set_xticklabels(labels, rotation=30, ha="right", fontsize=6)
+            ax.set_title(lbl, fontsize=8)
+        for j in range(len(val_features), len(axs)):
+            axs[j].axis("off")
+        _save(fig, behav_dir / "behaviour_feature_validation.png")
+
+    # ── E. Seasonal and diel fractions ────────────────────────────────────────
+    wf["doy"]  = pd.to_datetime(wf["window_start"], utc=True, errors="coerce").dt.dayofyear
+    wf["hour"] = pd.to_datetime(wf["window_start"], utc=True, errors="coerce").dt.hour
+
+    for time_col, bin_label, fname in [
+        ("doy",  "Day of year", "behaviour_seasonal.png"),
+        ("hour", "Hour (UTC)",  "behaviour_diel.png"),
+    ]:
+        if time_col not in wf.columns:
+            continue
+        wf["_bin"] = (wf[time_col] // (10 if time_col == "doy" else 1)) * \
+                     (10 if time_col == "doy" else 1)
+        pivot = (wf.groupby(["_bin", "behaviour"]).size()
+                   .unstack(fill_value=0)
+                   .reindex(columns=BEHAVIOUR_ORDER, fill_value=0))
+        pivot_frac = pivot.div(pivot.sum(axis=1), axis=0)
+
+        fig, ax = plt.subplots(figsize=(12, 4))
+        bottom = np.zeros(len(pivot_frac))
+        for beh in BEHAVIOUR_ORDER:
+            if beh not in pivot_frac.columns: continue
+            ax.fill_between(pivot_frac.index, bottom,
+                            bottom + pivot_frac[beh].values,
+                            color=BEHAVIOUR_COLOURS[beh], alpha=0.82,
+                            label=beh, step="mid")
+            bottom = bottom + pivot_frac[beh].values
+        ax.set_xlabel(bin_label); ax.set_ylabel("Fraction of windows")
+        ax.set_title(f"Behaviour fractions over {bin_label.lower()}")
+        ax.set_ylim(0, 1)
+        ax.legend(handles=[Patch(color=BEHAVIOUR_COLOURS[b], label=b)
+                            for b in BEHAVIOUR_ORDER],
+                  loc="upper right", fontsize=7, ncol=2)
+        _save(fig, behav_dir / fname)
+
+    # ── F. Behaviour × cluster matrix ─────────────────────────────────────────
+    if ctx.cluster_labels is not None:
+        wf["cluster"] = ctx.cluster_labels
+        k = ctx.n_clusters
+        mat = np.zeros((len(BEHAVIOUR_ORDER), k), dtype=float)
+        for bi, beh in enumerate(BEHAVIOUR_ORDER):
+            rows = wf[wf["behaviour"] == beh]
+            if len(rows) == 0: continue
+            counts = np.bincount(rows["cluster"].astype(int).values, minlength=k)
+            mat[bi] = counts / max(1, counts.sum())
+
+        fig, ax = plt.subplots(figsize=(max(8, k * 1.2), 5))
+        im = ax.imshow(mat, aspect="auto", cmap="YlOrRd", vmin=0, vmax=mat.max())
+        plt.colorbar(im, ax=ax, label="Fraction of behaviour windows in cluster", fraction=0.03)
+        ax.set_xticks(range(k)); ax.set_xticklabels([f"C{i}" for i in range(k)], fontsize=8)
+        ax.set_yticks(range(len(BEHAVIOUR_ORDER)))
+        ax.set_yticklabels(BEHAVIOUR_ORDER, fontsize=8)
+        ax.set_xlabel("Cluster"); ax.set_title("Behaviour × cluster membership")
+        for bi in range(len(BEHAVIOUR_ORDER)):
+            for ci in range(k):
+                v = mat[bi, ci]
+                if v > 0.15:
+                    ax.text(ci, bi, f"{v:.2f}", ha="center", va="center",
+                            fontsize=7, color="black" if v < 0.6 else "white")
+        _save(fig, behav_dir / "behaviour_cluster_matrix.png")
+
+    print(f"  Behaviour counts: "
+          + "  ".join(f"{b}:{(beh_all==b).sum():,}" for b in BEHAVIOUR_ORDER))
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # 5.  PLOT REGISTRY
 #     To add a plot: write a function, add it here.  Done.
@@ -1164,6 +1729,9 @@ PLOT_REGISTRY: Dict[str, callable] = {
     "temporal_doy":     plot_temporal_doy,
     "temporal_diel":    plot_temporal_diel,
     "individual_bird":  plot_individual_bird,
+    # ── new modules ──
+    "sex_study":        plot_sex_study,
+    "behaviour":        plot_behaviour_inference,
 }
 
 
@@ -1209,6 +1777,8 @@ def main():
                         help="Path to SimCLR logdir containing *_embeddings.csv")
     parser.add_argument("--catalogue",   default=None,
                         help="Path to bird_catalogue_enhanced.csv")
+    parser.add_argument("--window_catalogue", default=None,
+                        help="Path to window_catalogue_1h.csv (required for behaviour plot)")
     parser.add_argument("--outdir",      default=None,
                         help="Where to save plots (default: logdir/analysis)")
     parser.add_argument("--step",        type=int, default=None,
@@ -1244,12 +1814,13 @@ def main():
 
     print("Building analysis context …")
     ctx = build_context(
-        logdir      = logdir,
-        cat_path    = Path(args.catalogue) if args.catalogue else None,
-        step        = args.step,
-        space       = args.space,
-        n_clusters  = args.n_clusters,
-        umap_sample = args.umap_sample,
+        logdir       = logdir,
+        cat_path     = Path(args.catalogue) if args.catalogue else None,
+        step         = args.step,
+        space        = args.space,
+        n_clusters   = args.n_clusters,
+        umap_sample  = args.umap_sample,
+        win_cat_path = Path(args.window_catalogue) if args.window_catalogue else None,
     )
 
     run_plots(ctx, outdir, skip=skip, only=only, n_plot_birds=args.n_plot_birds)
