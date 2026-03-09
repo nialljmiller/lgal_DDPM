@@ -193,10 +193,20 @@ def prepare_meta(emb_df: pd.DataFrame, cat_df: Optional[pd.DataFrame]) -> pd.Dat
     # Join catalogue
     if cat_df is not None:
         cat_small = cat_df.copy()
-        # Try to merge on individual-local-identifier ↔ bird_id
+
+        # Determine the join key.  bird_catalogue_enhanced.csv has both
+        # bird_id (the safe-filename version) and individual-local-identifier.
+        # The embeddings use individual-local-identifier as bird_id.
+        # Strategy: prefer individual-local-identifier as the join key; if the
+        # catalogue already has bird_id AND individual-local-identifier, drop the
+        # catalogue's bird_id first to avoid the duplicate-column error.
         if "individual-local-identifier" in cat_small.columns:
+            # Drop catalogue's own bird_id if present to avoid collision
+            if "bird_id" in cat_small.columns:
+                cat_small = cat_small.drop(columns=["bird_id"])
             cat_small = cat_small.rename(
                 columns={"individual-local-identifier": "bird_id"})
+
         if "bird_id" in cat_small.columns:
             # Keep a useful subset of catalogue columns to avoid explosion
             keep_cols = ["bird_id", "animal-sex", "duration_days",
@@ -212,7 +222,9 @@ def prepare_meta(emb_df: pd.DataFrame, cat_df: Optional[pd.DataFrame]) -> pd.Dat
                          "bird_doy_first", "bird_doy_last",
                          "mean_lat", "mean_lon"]
             keep_cols = [c for c in keep_cols if c in cat_small.columns]
-            meta = meta.merge(cat_small[keep_cols], on="bird_id", how="left")
+            # Deduplicate catalogue rows on bird_id before merging
+            cat_small = cat_small[keep_cols].drop_duplicates(subset=["bird_id"])
+            meta = meta.merge(cat_small, on="bird_id", how="left")
 
     return meta
 
