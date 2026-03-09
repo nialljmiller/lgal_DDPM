@@ -63,10 +63,19 @@ That is it.  The runner will call it automatically unless --skip is used.
 """
 
 import argparse
+import os
 import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional
+
+# ── Thread caps — must be set before numpy/sklearn are imported ──────────────
+# The GH200 nodes expose many cores; OpenBLAS crashes if it tries to use them
+# all.  Cap at 16 which is safe for any current OpenBLAS build.
+for _var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS",
+             "MKL_NUM_THREADS", "BLIS_NUM_THREADS",
+             "VECLIB_MAXIMUM_THREADS", "NUMEXPR_NUM_THREADS"):
+    os.environ.setdefault(_var, "16")
 
 import matplotlib
 matplotlib.use("Agg")
@@ -321,7 +330,7 @@ def build_context(
     cluster_labels = None
     if HAS_SKLEARN:
         print(f"K-means clustering (k={n_clusters}) on {N:,} windows …")
-        km = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+        km = KMeans(n_clusters=n_clusters, random_state=42, n_init=10, n_jobs=1)
         cluster_labels = km.fit_predict(arr).astype(int)
 
     cluster_labels_sub = cluster_labels[sub_idx] if cluster_labels is not None else None
@@ -851,7 +860,7 @@ def plot_anomaly(ctx: PlotContext, outdir: Path) -> None:
         return
 
     print("  Running Isolation Forest …")
-    iso = IsolationForest(contamination=0.05, random_state=42, n_jobs=-1)
+    iso = IsolationForest(contamination=0.05, random_state=42, n_jobs=1)
     is_outlier_full = iso.fit_predict(ctx.arr) == -1   # True = outlier
 
     meta = ctx.meta.copy()
