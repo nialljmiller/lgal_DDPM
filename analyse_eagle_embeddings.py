@@ -330,7 +330,7 @@ def build_context(
     cluster_labels = None
     if HAS_SKLEARN:
         print(f"K-means clustering (k={n_clusters}) on {N:,} windows …")
-        km = KMeans(n_clusters=n_clusters, random_state=42, n_init=10, n_jobs=1)
+        km = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
         cluster_labels = km.fit_predict(arr).astype(int)
 
     cluster_labels_sub = cluster_labels[sub_idx] if cluster_labels is not None else None
