@@ -1,0 +1,8 @@
+__pycache__/
+*.log
+*.err
+*.pt
+golden_eai_outputs/
+GoldenEAI.csv
+GeldenEAI_meta.csv
+*.csv

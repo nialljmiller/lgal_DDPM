@@ -1,0 +1,16 @@
+per_bird_dir: golden_eai_outputs/per_bird_csv
+logdir: logs/simclr_20260306_131256
+train: True
+milestone: 0
+batch_size: 2048
+lr: 0.0003
+tau: 0.07
+hidden_dim: 128
+n_layers: 4
+out_dim: 64
+drop_prob: 0.2
+train_steps: 200000
+save_every: 5000
+infer_every: 10000
+num_workers: 8
+window_hours: 1
